@@ -10,6 +10,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog/v2"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -39,6 +40,13 @@ func (ct *RayJobController) ExecuteRayJob(ctx *gin.Context) {
 
 	pluginJson, _ := c.Template.Plugin.MarshalJSON()
 	klog.Info("Receive: ", string(pluginJson))
+	if !strings.Contains(string(pluginJson), "RayJob") {
+		klog.Info("### no ray job in plugin")
+		ct.Response200(ctx)
+		return
+	} else {
+		klog.Info("### found ray job in plugin")
+	}
 	err = json.Unmarshal(pluginJson, &inputBody)
 	if err != nil {
 		klog.Error(err)
@@ -157,6 +165,10 @@ func (ct *RayJobController) ResponseRayJob(ctx *gin.Context, job *rayjob.RayJob)
 
 func (ct *RayJobController) Response404(ctx *gin.Context) {
 	ctx.AbortWithStatus(http.StatusNotFound)
+}
+
+func (ct *RayJobController) Response200(ctx *gin.Context) {
+	ctx.AbortWithStatus(http.StatusOK)
 }
 
 func InjectRayJobWithWorkflowName(job *rayjob.RayJob, workflowName string) {
