@@ -2,6 +2,7 @@ package controller
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"sort"
 	"strings"
@@ -13,6 +14,9 @@ import (
 	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
 	rayversioned "github.com/ray-project/kuberay/ray-operator/pkg/client/clientset/versioned"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/klog/v2"
 )
 
@@ -20,8 +24,17 @@ const (
 	LabelKeyWorkflow string = "workflows.argoproj.io/workflow"
 )
 
+// workflowGVR is the GroupVersionResource for Argo Workflows.
+var workflowGVR = schema.GroupVersionResource{
+	Group:    "argoproj.io",
+	Version:  "v1alpha1",
+	Resource: "workflows",
+}
+
 type RayClusterController struct {
 	RayClient *rayversioned.Clientset
+	// DynClient is used to patch Workflow annotations with cluster/job info.
+	DynClient dynamic.Interface
 }
 
 type RayPluginBody struct {
@@ -93,6 +106,11 @@ func (ct *RayClusterController) handleRayJob(ctx *gin.Context, c *executorplugin
 	// 2. found and return
 	if existsJob != nil {
 		klog.Info("# found exists Ray Job: ", job.Name, "returning Status...", existsJob.Status)
+		// When job is terminal, write its info back to the Workflow annotations.
+		if getRayJobPhase(existsJob.Status.JobStatus) == wfv1.NodeSucceeded || getRayJobPhase(existsJob.Status.JobStatus) == wfv1.NodeFailed {
+			ct.patchWorkflowAnnotations(ctx, c.Workflow.ObjectMeta.Namespace, c.Workflow.ObjectMeta.Name,
+				buildRayJobAnnotations(existsJob))
+		}
 		ct.ResponseRayJob(ctx, existsJob)
 		return
 	}
@@ -133,23 +151,24 @@ func (ct *RayClusterController) handleRayCluster(ctx *gin.Context, c *executorpl
 		cluster.Namespace = "default"
 	}
 
-	var exists = false
-
 	// 1. query cluster exists
 	existsCluster, err := ct.RayClient.RayV1().RayClusters(cluster.Namespace).Get(ctx, cluster.Name, metav1.GetOptions{})
 	if err != nil {
-		exists = false
-	} else {
-		exists = true
+		existsCluster = nil
 	}
-	// 2. found and return
-	if exists {
+
+	// 2. found: check readiness and patch workflow annotations, then return
+	if existsCluster != nil {
 		klog.Info("# found exists Ray Cluster: ", cluster.Name, "returning Status...", existsCluster.Status)
+		if getRayClusterPhase(existsCluster) == wfv1.NodeSucceeded {
+			ct.patchWorkflowAnnotations(ctx, c.Workflow.ObjectMeta.Namespace, c.Workflow.ObjectMeta.Name,
+				buildRayClusterAnnotations(existsCluster))
+		}
 		ct.ResponseRayCluster(ctx, existsCluster)
 		return
 	}
 
-	// 3.Label keys with workflow Name
+	// 3. Label keys with workflow Name and create
 	InjectRayClusterWithWorkflowName(cluster, c.Workflow.ObjectMeta.Name)
 
 	newCluster, err := ct.RayClient.RayV1().RayClusters(cluster.Namespace).Create(ctx, cluster, metav1.CreateOptions{})
@@ -433,4 +452,107 @@ func InjectRayClusterWithWorkflowName(cluster *rayv1.RayCluster, workflowName st
 
 	cluster.Spec.HeadGroupSpec = headGroupSpec
 	cluster.Spec.WorkerGroupSpecs = workerGroupSpecs
+}
+
+// getRayClusterPhase derives the Argo NodePhase from a RayCluster's status.
+func getRayClusterPhase(cluster *rayv1.RayCluster) wfv1.NodePhase {
+	switch cluster.Status.State {
+	case rayv1.Ready:
+		return wfv1.NodeSucceeded
+	case rayv1.Failed:
+		return wfv1.NodeFailed
+	case rayv1.Suspended:
+		return wfv1.NodeSucceeded
+	default:
+		if isRayClusterConditionTrue(cluster, rayv1.HeadPodReady) || isRayClusterConditionTrue(cluster, rayv1.RayClusterProvisioned) {
+			return wfv1.NodeSucceeded
+		}
+		return wfv1.NodePending
+	}
+}
+
+// buildRayClusterAnnotations returns the key/value pairs to be written to the
+// Workflow annotations when a RayCluster becomes ready.
+func buildRayClusterAnnotations(cluster *rayv1.RayCluster) map[string]string {
+	host := cluster.Status.Head.ServiceIP
+	if host == "" {
+		host = cluster.Status.Head.PodIP
+	}
+	if cluster.Status.Head.ServiceName != "" && cluster.Namespace != "" {
+		host = cluster.Status.Head.ServiceName + "." + cluster.Namespace + ".svc.cluster.local"
+	}
+
+	ann := map[string]string{
+		"ray.io/cluster-state":      string(cluster.Status.State),
+		"ray.io/head-service-fqdn":  host,
+		"ray.io/head-pod-ip":        cluster.Status.Head.PodIP,
+		"ray.io/head-service-ip":    cluster.Status.Head.ServiceIP,
+		"ray.io/head-service-name":  cluster.Status.Head.ServiceName,
+	}
+
+	if host != "" {
+		if port, ok := cluster.Status.Endpoints["client"]; ok && port != "" {
+			ann["ray.io/address"] = "ray://" + host + ":" + port
+		}
+		if port, ok := cluster.Status.Endpoints["dashboard"]; ok && port != "" {
+			ann["ray.io/dashboard-url"] = "http://" + host + ":" + port
+		}
+		if port, ok := cluster.Status.Endpoints["gcs-server"]; ok && port != "" {
+			ann["ray.io/gcs-address"] = host + ":" + port
+		}
+	}
+
+	if len(cluster.Status.Endpoints) > 0 {
+		if data, err := json.Marshal(cluster.Status.Endpoints); err == nil {
+			ann["ray.io/endpoints"] = string(data)
+		}
+	}
+
+	return ann
+}
+
+// buildRayJobAnnotations returns the key/value pairs to be written to the
+// Workflow annotations when a RayJob reaches a terminal state.
+func buildRayJobAnnotations(job *rayv1.RayJob) map[string]string {
+	ann := map[string]string{
+		"ray.io/job-id":                job.Status.JobId,
+		"ray.io/job-status":            string(job.Status.JobStatus),
+		"ray.io/job-deployment-status": string(job.Status.JobDeploymentStatus),
+		"ray.io/job-message":           job.Status.Message,
+	}
+	if job.Status.StartTime != nil {
+		ann["ray.io/job-start-time"] = job.Status.StartTime.String()
+	}
+	if job.Status.EndTime != nil {
+		ann["ray.io/job-end-time"] = job.Status.EndTime.String()
+	}
+	return ann
+}
+
+// patchWorkflowAnnotations merges the given annotations into the Workflow resource.
+func (ct *RayClusterController) patchWorkflowAnnotations(ctx *gin.Context, namespace, name string, annotations map[string]string) {
+	if ct.DynClient == nil || namespace == "" || name == "" || len(annotations) == 0 {
+		return
+	}
+
+	// Build JSON merge-patch: {"metadata":{"annotations":{...}}}
+	annJSON, err := json.Marshal(annotations)
+	if err != nil {
+		klog.Errorf("patchWorkflowAnnotations: marshal error: %v", err)
+		return
+	}
+	patch := fmt.Sprintf(`{"metadata":{"annotations":%s}}`, string(annJSON))
+
+	_, err = ct.DynClient.Resource(workflowGVR).Namespace(namespace).Patch(
+		ctx,
+		name,
+		types.MergePatchType,
+		[]byte(patch),
+		metav1.PatchOptions{},
+	)
+	if err != nil {
+		klog.Errorf("patchWorkflowAnnotations: patch workflow %s/%s failed: %v", namespace, name, err)
+		return
+	}
+	klog.Infof("patchWorkflowAnnotations: patched workflow %s/%s with %s", namespace, name, patch)
 }

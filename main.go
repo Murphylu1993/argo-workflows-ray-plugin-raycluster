@@ -11,6 +11,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/spf13/cobra"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/homedir"
@@ -52,8 +53,13 @@ func (o *option) runE(c *cobra.Command, args []string) (err error) {
 
 	ct := &controller.RayClusterController{}
 	rayClient := getRayClient(config)
+	dynClient, err := dynamic.NewForConfig(config)
+	if err != nil {
+		panic(err.Error())
+	}
 
 	ct.RayClient = rayClient
+	ct.DynClient = dynClient
 	router := gin.Default()
 	router.POST("/api/v1/template.execute", ct.Execute)
 	if err := router.Run(fmt.Sprintf(":%d", o.port)); err != nil {
