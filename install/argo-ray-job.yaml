@@ -1,21 +1,173 @@
+# ============================================================
+# Example 1: RayJob — submit a job and use its output params
+# ============================================================
 apiVersion: argoproj.io/v1alpha1
 kind: Workflow
 metadata:
-  generateName: ray-distributed-demo-
+  generateName: ray-job-demo-
 spec:
-  entrypoint: ray-demo
+  entrypoint: main
   templates:
-    - name: ray-demo
+
+    # ── entrypoint: sequential steps ──────────────────────────
+    - name: main
+      steps:
+        - - name: submit-ray-job
+            template: ray-job-template
+
+        # Use output params from the plugin step in a downstream step
+        - - name: print-result
+            template: print-job-result
+            arguments:
+              parameters:
+                - name: job-id
+                  value: "{{steps.submit-ray-job.outputs.parameters.ray-job-id}}"
+                - name: status
+                  value: "{{steps.submit-ray-job.outputs.parameters.ray-job-status}}"
+                - name: deployment-status
+                  value: "{{steps.submit-ray-job.outputs.parameters.ray-job-deployment-status}}"
+
+    # ── plugin template: creates / polls the RayJob ───────────
+    - name: ray-job-template
+      # Declare the output parameters that the plugin will populate.
+      # Names must match the keys returned by buildRayJobOutputs().
+      outputs:
+        parameters:
+          - name: ray-job-id
+            valueFrom:
+              supplied: {}
+          - name: ray-job-status
+            valueFrom:
+              supplied: {}
+          - name: ray-job-deployment-status
+            valueFrom:
+              supplied: {}
+          - name: ray-job-message
+            valueFrom:
+              supplied: {}
+          - name: ray-job-start-time
+            valueFrom:
+              supplied: {}
+          - name: ray-job-end-time
+            valueFrom:
+              supplied: {}
       plugin:
         ray:
-          # RayCluster definition (Ray Operator must be installed in advance)
+          apiVersion: ray.io/v1
+          kind: RayJob
+          metadata:
+            name: ray-job-example
+            namespace: argo
+          spec:
+            entrypoint: python /home/ray/samples/sample_code.py
+            runtimeEnvYAML: |
+              working_dir: "https://github.com/ray-project/ray/archive/refs/heads/master.zip"
+            shutdownAfterJobFinishes: true
+            rayClusterSpec:
+              headGroupSpec:
+                rayStartParams:
+                  dashboard-host: '0.0.0.0'
+                template:
+                  spec:
+                    containers:
+                      - name: ray-head
+                        image: rayproject/ray:2.9.3
+                        ports:
+                          - containerPort: 6379
+                          - containerPort: 8265
+                        resources:
+                          limits:
+                            cpu: 2
+                            memory: 4Gi
+              workerGroupSpecs:
+                - replicas: 2
+                  minReplicas: 1
+                  maxReplicas: 3
+                  groupName: worker
+                  rayStartParams: {}
+                  template:
+                    spec:
+                      containers:
+                        - name: ray-worker
+                          image: rayproject/ray:2.9.3
+                          resources:
+                            limits:
+                              cpu: 4
+                              memory: 8Gi
+
+    # ── downstream step that consumes the output params ───────
+    - name: print-job-result
+      inputs:
+        parameters:
+          - name: job-id
+          - name: status
+          - name: deployment-status
+      container:
+        image: alpine
+        command: [sh, -c]
+        args:
+          - |
+            echo "RayJob ID:          {{inputs.parameters.job-id}}"
+            echo "Job status:         {{inputs.parameters.status}}"
+            echo "Deployment status:  {{inputs.parameters.deployment-status}}"
+
+---
+# ============================================================
+# Example 2: RayCluster — create a cluster and connect to it
+# ============================================================
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: ray-cluster-demo-
+spec:
+  entrypoint: main
+  templates:
+
+    - name: main
+      steps:
+        - - name: create-cluster
+            template: ray-cluster-template
+
+        - - name: run-training
+            template: training-job
+            arguments:
+              parameters:
+                - name: ray-address
+                  value: "{{steps.create-cluster.outputs.parameters.ray-address}}"
+                - name: dashboard-url
+                  value: "{{steps.create-cluster.outputs.parameters.ray-dashboard-url}}"
+
+    - name: ray-cluster-template
+      # Declare every parameter the plugin may populate.
+      # Names must match the keys returned by buildRayClusterOutputs().
+      outputs:
+        parameters:
+          - name: ray-cluster-state
+            valueFrom:
+              supplied: {}
+          - name: ray-head-service-fqdn
+            valueFrom:
+              supplied: {}
+          - name: ray-address           # ray://<fqdn>:<client-port>
+            valueFrom:
+              supplied: {}
+          - name: ray-dashboard-url     # http://<fqdn>:<dashboard-port>
+            valueFrom:
+              supplied: {}
+          - name: ray-gcs-address       # <fqdn>:<gcs-port>
+            valueFrom:
+              supplied: {}
+          - name: ray-endpoints-json    # full endpoints map as JSON
+            valueFrom:
+              supplied: {}
+      plugin:
+        ray:
           apiVersion: ray.io/v1
           kind: RayCluster
           metadata:
-            name: ray-example
+            name: ray-cluster-example
             namespace: argo
           spec:
-            rayVersion: "2.9.3"
             headGroupSpec:
               rayStartParams:
                 dashboard-host: '0.0.0.0'
@@ -25,16 +177,15 @@ spec:
                     - name: ray-head
                       image: rayproject/ray:2.9.3
                       ports:
-                        - containerPort: 6379
-                        - containerPort: 8265
+                        - containerPort: 6379   # gcs-server
+                        - containerPort: 8265   # dashboard
+                        - containerPort: 10001  # client
                       resources:
                         limits:
                           cpu: 2
                           memory: 4Gi
             workerGroupSpecs:
               - replicas: 2
-                minReplicas: 1
-                maxReplicas: 3
                 groupName: worker
                 rayStartParams: {}
                 template:
@@ -46,3 +197,18 @@ spec:
                           limits:
                             cpu: 4
                             memory: 8Gi
+
+    - name: training-job
+      inputs:
+        parameters:
+          - name: ray-address
+          - name: dashboard-url
+      container:
+        image: rayproject/ray:2.9.3
+        command: [python, -c]
+        args:
+          - |
+            import ray
+            ray.init(address="{{inputs.parameters.ray-address}}")
+            print("Connected to Ray cluster")
+            print("Dashboard:", "{{inputs.parameters.dashboard-url}}")

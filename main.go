@@ -55,7 +55,7 @@ func (o *option) runE(c *cobra.Command, args []string) (err error) {
 
 	ct.RayClient = rayClient
 	router := gin.Default()
-	router.POST("/api/v1/template.execute", ct.ExecuteRayCluster)
+	router.POST("/api/v1/template.execute", ct.Execute)
 	if err := router.Run(fmt.Sprintf(":%d", o.port)); err != nil {
 		klog.Fatal("Failed to start server:", err)
 	}
