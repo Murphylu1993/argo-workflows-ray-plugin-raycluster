@@ -4,7 +4,7 @@ data:
   sidecar.container: |
     command:
     - argo-ray-plugin
-    image: argo-ray-plugin:v1
+    image: argo-ray-plugin:v20260402-gcfix
     name: ray-executor-plugin
     ports:
     - containerPort: 3028

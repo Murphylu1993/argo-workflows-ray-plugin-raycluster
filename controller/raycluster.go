@@ -117,6 +117,12 @@ func (ct *RayClusterController) handleRayJob(ctx *gin.Context, c *executorplugin
 
 	// 3. Label keys with workflow Name
 	InjectRayJobWithWorkflowName(job, c.Workflow.ObjectMeta.Name)
+	attachWorkflowOwnerReference(
+		&job.ObjectMeta,
+		c.Workflow.ObjectMeta.Name,
+		c.Workflow.ObjectMeta.Namespace,
+		c.Workflow.ObjectMeta.Uid,
+	)
 
 	newJob, err := ct.RayClient.RayV1().RayJobs(job.Namespace).Create(ctx, job, metav1.CreateOptions{})
 	if err != nil {
@@ -160,7 +166,8 @@ func (ct *RayClusterController) handleRayCluster(ctx *gin.Context, c *executorpl
 	// 2. found: check readiness and patch workflow annotations, then return
 	if existsCluster != nil {
 		klog.Info("# found exists Ray Cluster: ", cluster.Name, "returning Status...", existsCluster.Status)
-		if getRayClusterPhase(existsCluster) == wfv1.NodeSucceeded {
+		phase := getRayClusterPhase(existsCluster)
+		if phase == wfv1.NodeRunning || phase == wfv1.NodeSucceeded {
 			ct.patchWorkflowAnnotations(ctx, c.Workflow.ObjectMeta.Namespace, c.Workflow.ObjectMeta.Name,
 				buildRayClusterAnnotations(existsCluster))
 		}
@@ -170,6 +177,12 @@ func (ct *RayClusterController) handleRayCluster(ctx *gin.Context, c *executorpl
 
 	// 3. Label keys with workflow Name and create
 	InjectRayClusterWithWorkflowName(cluster, c.Workflow.ObjectMeta.Name)
+	attachWorkflowOwnerReference(
+		&cluster.ObjectMeta,
+		c.Workflow.ObjectMeta.Name,
+		c.Workflow.ObjectMeta.Namespace,
+		c.Workflow.ObjectMeta.Uid,
+	)
 
 	newCluster, err := ct.RayClient.RayV1().RayClusters(cluster.Namespace).Create(ctx, cluster, metav1.CreateOptions{})
 	if err != nil {
@@ -274,21 +287,7 @@ func (ct *RayClusterController) ResponseMsg(ctx *gin.Context, status wfv1.NodePh
 }
 
 func (ct *RayClusterController) ResponseRayCluster(ctx *gin.Context, cluster *rayv1.RayCluster) {
-	var status wfv1.NodePhase
-	switch cluster.Status.State {
-	case rayv1.Ready:
-		status = wfv1.NodeSucceeded
-	case rayv1.Failed:
-		status = wfv1.NodeFailed
-	case rayv1.Suspended:
-		status = wfv1.NodeSucceeded
-	default:
-		if isRayClusterConditionTrue(cluster, rayv1.HeadPodReady) || isRayClusterConditionTrue(cluster, rayv1.RayClusterProvisioned) {
-			status = wfv1.NodeSucceeded
-		} else {
-			status = wfv1.NodePending
-		}
-	}
+	status := getRayClusterPhase(cluster)
 
 	var requeue *metav1.Duration
 	if status == wfv1.NodeRunning || status == wfv1.NodePending {
@@ -454,18 +453,49 @@ func InjectRayClusterWithWorkflowName(cluster *rayv1.RayCluster, workflowName st
 	cluster.Spec.WorkerGroupSpecs = workerGroupSpecs
 }
 
+// attachWorkflowOwnerReference sets Workflow as owner for same-namespace resources.
+// This enables Kubernetes garbage collection to delete Ray resources with the Workflow.
+func attachWorkflowOwnerReference(objMeta *metav1.ObjectMeta, workflowName, workflowNamespace, workflowUID string) {
+	if objMeta == nil {
+		return
+	}
+	if workflowUID == "" {
+		return
+	}
+	if objMeta.Namespace != "" && workflowNamespace != "" && objMeta.Namespace != workflowNamespace {
+		// Cross-namespace owner references are invalid in Kubernetes.
+		return
+	}
+
+	ownerRef := metav1.OwnerReference{
+		APIVersion: "argoproj.io/v1alpha1",
+		Kind:       "Workflow",
+		Name:       workflowName,
+		UID:        types.UID(workflowUID),
+	}
+
+	for i := range objMeta.OwnerReferences {
+		if objMeta.OwnerReferences[i].UID == ownerRef.UID {
+			objMeta.OwnerReferences[i] = ownerRef
+			return
+		}
+	}
+	objMeta.OwnerReferences = append(objMeta.OwnerReferences, ownerRef)
+}
+
 // getRayClusterPhase derives the Argo NodePhase from a RayCluster's status.
+// For long-running Ray clusters, a healthy/ready cluster is represented as Running.
 func getRayClusterPhase(cluster *rayv1.RayCluster) wfv1.NodePhase {
 	switch cluster.Status.State {
 	case rayv1.Ready:
-		return wfv1.NodeSucceeded
+		return wfv1.NodeRunning
 	case rayv1.Failed:
 		return wfv1.NodeFailed
 	case rayv1.Suspended:
 		return wfv1.NodeSucceeded
 	default:
 		if isRayClusterConditionTrue(cluster, rayv1.HeadPodReady) || isRayClusterConditionTrue(cluster, rayv1.RayClusterProvisioned) {
-			return wfv1.NodeSucceeded
+			return wfv1.NodeRunning
 		}
 		return wfv1.NodePending
 	}
