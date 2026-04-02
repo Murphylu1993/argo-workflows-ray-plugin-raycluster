@@ -4,9 +4,10 @@ import (
 	"argo-workflows-ray-plugin/controller"
 	"flag"
 	"fmt"
+	"path/filepath"
+
 	rayversioned "github.com/ray-project/kuberay/ray-operator/pkg/client/clientset/versioned"
 	"k8s.io/klog/v2"
-	"path/filepath"
 
 	"github.com/gin-gonic/gin"
 	"github.com/spf13/cobra"
@@ -49,12 +50,12 @@ func (o *option) runE(c *cobra.Command, args []string) (err error) {
 		}
 	}
 
-	ct := &controller.RayJobController{}
+	ct := &controller.RayClusterController{}
 	rayClient := getRayClient(config)
 
 	ct.RayClient = rayClient
 	router := gin.Default()
-	router.POST("/api/v1/template.execute", ct.ExecuteRayJob)
+	router.POST("/api/v1/template.execute", ct.ExecuteRayCluster)
 	if err := router.Run(fmt.Sprintf(":%d", o.port)); err != nil {
 		klog.Fatal("Failed to start server:", err)
 	}
