@@ -6,12 +6,12 @@ import (
 	"fmt"
 	"path/filepath"
 
+	wfversioned "github.com/argoproj/argo-workflows/v3/pkg/client/clientset/versioned"
 	rayversioned "github.com/ray-project/kuberay/ray-operator/pkg/client/clientset/versioned"
 	"k8s.io/klog/v2"
 
 	"github.com/gin-gonic/gin"
 	"github.com/spf13/cobra"
-	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/homedir"
@@ -43,7 +43,7 @@ func (o *option) runE(c *cobra.Command, args []string) (err error) {
 	}
 	flag.Parse()
 
-	// use the current context in kubeconfig
+	// Use the current context in kubeconfig, fall back to in-cluster config.
 	config, err := clientcmd.BuildConfigFromFlags("", *kubeconfig)
 	if err != nil {
 		if config, err = rest.InClusterConfig(); err != nil {
@@ -51,15 +51,16 @@ func (o *option) runE(c *cobra.Command, args []string) (err error) {
 		}
 	}
 
-	ct := &controller.RayClusterController{}
-	rayClient := getRayClient(config)
-	dynClient, err := dynamic.NewForConfig(config)
+	argoClient, err := wfversioned.NewForConfig(config)
 	if err != nil {
 		panic(err.Error())
 	}
 
-	ct.RayClient = rayClient
-	ct.DynClient = dynClient
+	ct := &controller.RayController{
+		RayClient:  getRayClient(config),
+		ArgoClient: argoClient,
+	}
+
 	router := gin.Default()
 	router.POST("/api/v1/template.execute", ct.Execute)
 	if err := router.Run(fmt.Sprintf(":%d", o.port)); err != nil {
@@ -68,7 +69,7 @@ func (o *option) runE(c *cobra.Command, args []string) (err error) {
 	return
 }
 
-// GetRayClient get a clientset for Ray Job.
+// getRayClient creates a typed clientset for KubeRay resources.
 func getRayClient(restConfig *rest.Config) *rayversioned.Clientset {
 	clientset, err := rayversioned.NewForConfig(restConfig)
 	klog.Info(clientset.ServerVersion())
